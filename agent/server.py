@@ -10,6 +10,63 @@ import warnings
 
 logger = logging.getLogger(__name__)
 
+
+def _is_local_poc_mode() -> bool:
+    return os.getenv("SANDBOX_TYPE") == "local" and not any(
+        os.getenv(key)
+        for key in (
+            "LANGSMITH_API_KEY",
+            "LANGSMITH_API_KEY_PROD",
+            "LANGSMITH_TENANT_ID_PROD",
+            "LANGSMITH_TRACING_PROJECT_ID_PROD",
+        )
+    )
+
+
+class _SuppressMessageFilter(logging.Filter):
+    def __init__(self, *substrings: str):
+        super().__init__()
+        self.substrings = substrings
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not all(substring in message for substring in self.substrings)
+
+
+if _is_local_poc_mode():
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*langsmith\.sandbox is in alpha.*",
+        category=FutureWarning,
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Calling \.text\(\) as a method is deprecated.*",
+    )
+    warnings.filterwarnings(
+        "ignore",
+        message=r".*Pydantic serializer warnings:.*",
+    )
+    logging.getLogger("langsmith.client").addFilter(
+        _SuppressMessageFilter("Failed to send compressed multipart ingest:")
+    )
+    logging.getLogger("langgraph_api.timing.timer").addFilter(
+        _SuppressMessageFilter("Import for graph agent exceeded the expected startup time")
+    )
+    logging.getLogger("langgraph_api.server").addFilter(
+        _SuppressMessageFilter("GET /threads/", "404")
+    )
+    logging.getLogger("httpx").addFilter(
+        _SuppressMessageFilter(
+            "GET http://localhost:2024/threads/",
+            "404 Not Found",
+        )
+    )
+    logging.getLogger("langgraph_api.graph").addFilter(
+        _SuppressMessageFilter("Slow graph load. Accessing graph 'agent'")
+    )
+    logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
+
 from langgraph.config import get_config
 from langgraph.graph.state import RunnableConfig
 from langgraph.pregel import Pregel
@@ -70,6 +127,7 @@ from .utils.agents_md import read_agents_md_in_sandbox
 from .utils.github import (
     _CRED_FILE_PATH,
     cleanup_git_credentials,
+    get_github_default_branch,
     git_has_uncommitted_changes,
     is_valid_git_repo,
     remove_directory,
@@ -79,11 +137,33 @@ from .utils.sandbox_paths import aresolve_repo_dir, aresolve_sandbox_work_dir
 from .utils.sandbox_state import SANDBOX_BACKENDS, get_sandbox_id_from_metadata
 
 
+def _get_reply_tools(source: str) -> list:
+    """Return source-appropriate reply tools."""
+    if source == "github":
+        return [github_comment]
+    if source == "slack":
+        return [slack_thread_reply]
+    if source == "linear":
+        return [linear_comment]
+    return [linear_comment, slack_thread_reply, github_comment]
+
+
+async def _persist_sandbox_metadata(
+    thread_id: str, sandbox_id: str, repo_dir: str | None = None
+) -> None:
+    """Store the active sandbox metadata on the thread."""
+    metadata: dict[str, str] = {"sandbox_id": sandbox_id}
+    if repo_dir:
+        metadata["repo_dir"] = repo_dir
+    await client.threads.update(thread_id=thread_id, metadata=metadata)
+
+
 async def _clone_or_pull_repo_in_sandbox(  # noqa: PLR0915
     sandbox_backend: SandboxBackendProtocol,
     owner: str,
     repo: str,
     github_token: str | None = None,
+    branch_name: str | None = None,
 ) -> str:
     """Clone a GitHub repo into the sandbox, or pull if it already exists.
 
@@ -92,6 +172,7 @@ async def _clone_or_pull_repo_in_sandbox(  # noqa: PLR0915
         owner: GitHub repo owner
         repo: GitHub repo name
         github_token: GitHub access token (from agent auth or env var)
+        branch_name: Optional existing branch to sync to instead of the default branch
 
     Returns:
         Path to the cloned/updated repo directory
@@ -138,24 +219,42 @@ async def _clone_or_pull_repo_in_sandbox(  # noqa: PLR0915
             logger.warning("Repo has uncommitted changes at %s, skipping pull", repo_dir)
             return repo_dir
 
-        logger.info("Repo is clean, pulling latest changes from %s/%s", owner, repo)
+        target_branch = branch_name or await get_github_default_branch(owner, repo, token)
+        safe_target_branch = shlex.quote(target_branch)
+        safe_origin_target_branch = shlex.quote(f"origin/{target_branch}")
+
+        logger.info(
+            "Repo is clean, syncing %s/%s to origin/%s",
+            owner,
+            repo,
+            target_branch,
+        )
 
         await loop.run_in_executor(None, setup_git_credentials, sandbox_backend, token)
         try:
-            pull_result = await loop.run_in_executor(
+            sync_result = await loop.run_in_executor(
                 None,
                 sandbox_backend.execute,
-                f"cd {repo_dir} && git {cred_helper_arg} pull origin $(git rev-parse --abbrev-ref HEAD)",
+                " && ".join(
+                    [
+                        f"cd {repo_dir}",
+                        f"git {cred_helper_arg} fetch origin --prune",
+                        f"(git checkout {safe_target_branch} || git checkout -B {safe_target_branch} {safe_origin_target_branch})",
+                        f"git reset --hard {safe_origin_target_branch}",
+                        "git clean -fd",
+                    ]
+                ),
             )
-            logger.debug("Git pull result: exit_code=%s", pull_result.exit_code)
-            if pull_result.exit_code != 0:
-                logger.warning(
-                    "Git pull failed with exit code %s: %s",
-                    pull_result.exit_code,
-                    pull_result.output[:200] if pull_result.output else "",
+            logger.debug("Git sync result: exit_code=%s", sync_result.exit_code)
+            if sync_result.exit_code != 0:
+                msg = (
+                    f"Failed to sync repo {owner}/{repo} to origin/{target_branch}: "
+                    f"{sync_result.output}"
                 )
+                logger.error(msg)
+                raise RuntimeError(msg)
         except Exception:
-            logger.exception("Failed to execute git pull")
+            logger.exception("Failed to sync repo to the expected base branch")
             raise
         finally:
             await loop.run_in_executor(None, cleanup_git_credentials, sandbox_backend)
@@ -193,6 +292,7 @@ async def _recreate_sandbox(
     repo_name: str,
     *,
     github_token: str | None,
+    branch_name: str | None = None,
 ) -> tuple[SandboxBackendProtocol, str]:
     """Recreate a sandbox and clone the repo after a connection failure.
 
@@ -207,8 +307,9 @@ async def _recreate_sandbox(
     try:
         sandbox_backend = await asyncio.to_thread(create_sandbox)
         repo_dir = await _clone_or_pull_repo_in_sandbox(
-            sandbox_backend, repo_owner, repo_name, github_token
+            sandbox_backend, repo_owner, repo_name, github_token, branch_name
         )
+        await _persist_sandbox_metadata(thread_id, sandbox_backend.id, repo_dir)
     except Exception:
         logger.exception("Failed to recreate sandbox after connection failure")
         await client.threads.update(thread_id=thread_id, metadata={"sandbox_id": None})
@@ -253,6 +354,7 @@ DEFAULT_RECURSION_LIMIT = 1_000
 async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
     """Get or create an agent with a sandbox for the given thread."""
     thread_id = config["configurable"].get("thread_id", None)
+    branch_name = config.get("metadata", {}).get("branch_name")
 
     config["recursion_limit"] = DEFAULT_RECURSION_LIMIT
 
@@ -286,7 +388,11 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             logger.info("Pulling latest changes for repo %s/%s", repo_owner, repo_name)
             try:
                 repo_dir = await _clone_or_pull_repo_in_sandbox(
-                    sandbox_backend, repo_owner, repo_name, github_token
+                    sandbox_backend,
+                    repo_owner,
+                    repo_name,
+                    github_token,
+                    branch_name,
                 )
             except SandboxClientError:
                 logger.warning(
@@ -294,7 +400,11 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
                     thread_id,
                 )
                 sandbox_backend, repo_dir = await _recreate_sandbox(
-                    thread_id, repo_owner, repo_name, github_token=github_token
+                    thread_id,
+                    repo_owner,
+                    repo_name,
+                    github_token=github_token,
+                    branch_name=branch_name,
                 )
             except Exception:
                 logger.exception("Failed to pull repo in cached sandbox")
@@ -313,14 +423,13 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             if repo_owner and repo_name:
                 logger.info("Cloning repo %s/%s into sandbox", repo_owner, repo_name)
                 repo_dir = await _clone_or_pull_repo_in_sandbox(
-                    sandbox_backend, repo_owner, repo_name, github_token
+                    sandbox_backend,
+                    repo_owner,
+                    repo_name,
+                    github_token,
+                    branch_name,
                 )
                 logger.info("Repo cloned to %s", repo_dir)
-
-                await client.threads.update(
-                    thread_id=thread_id,
-                    metadata={"repo_dir": repo_dir},
-                )
         except Exception:
             logger.exception("Failed to create sandbox or clone repo")
             try:
@@ -358,7 +467,11 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             logger.info("Pulling latest changes for repo %s/%s", repo_owner, repo_name)
             try:
                 repo_dir = await _clone_or_pull_repo_in_sandbox(
-                    sandbox_backend, repo_owner, repo_name, github_token
+                    sandbox_backend,
+                    repo_owner,
+                    repo_name,
+                    github_token,
+                    branch_name,
                 )
             except SandboxClientError:
                 logger.warning(
@@ -366,19 +479,23 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
                     thread_id,
                 )
                 sandbox_backend, repo_dir = await _recreate_sandbox(
-                    thread_id, repo_owner, repo_name, github_token=github_token
+                    thread_id,
+                    repo_owner,
+                    repo_name,
+                    github_token=github_token,
+                    branch_name=branch_name,
                 )
             except Exception:
                 logger.exception("Failed to pull repo in existing sandbox")
                 raise
 
     SANDBOX_BACKENDS[thread_id] = sandbox_backend
+    await _persist_sandbox_metadata(thread_id, sandbox_backend.id, repo_dir)
 
     if not repo_dir:
         msg = "Cannot proceed: no repo was cloned. Set 'repo.owner' and 'repo.name' in the configurable config"
         raise RuntimeError(msg)
 
-    branch_name = get_config().get("metadata", {}).get("branch_name")
     if branch_name:
         logger.info("Checking out branch '%s' in sandbox for thread %s", branch_name, thread_id)
         loop = asyncio.get_event_loop()
@@ -399,6 +516,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
     linear_issue = config["configurable"].get("linear_issue", {})
     linear_project_id = linear_issue.get("linear_project_id", "")
     linear_issue_number = linear_issue.get("linear_issue_number", "")
+    source = config["configurable"].get("source", "")
     agents_md = await read_agents_md_in_sandbox(sandbox_backend, repo_dir)
 
     logger.info("Returning agent with sandbox for thread %s", thread_id)
@@ -419,15 +537,12 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             fetch_url,
             web_search,
             commit_and_open_pr,
-            linear_comment,
             linear_create_issue,
             linear_delete_issue,
             linear_get_issue,
             linear_get_issue_comments,
             linear_list_teams,
             linear_update_issue,
-            slack_thread_reply,
-            github_comment,
             list_pr_reviews,
             get_pr_review,
             create_pr_review,
@@ -435,6 +550,7 @@ async def get_agent(config: RunnableConfig) -> Pregel:  # noqa: PLR0915
             dismiss_pr_review,
             submit_pr_review,
             list_pr_review_comments,
+            *_get_reply_tools(source),
         ],
         backend=sandbox_backend,
         middleware=[

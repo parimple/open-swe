@@ -4,6 +4,7 @@ from typing import Any
 
 from langgraph.config import get_config
 
+from ..utils.auth import resolve_github_token
 from ..utils.authorship import (
     OPEN_SWE_BOT_EMAIL,
     OPEN_SWE_BOT_NAME,
@@ -15,7 +16,7 @@ from ..utils.github import (
     create_github_pr,
     get_github_default_branch,
     git_add_all,
-    git_checkout_branch,
+    git_checkout_branch_from_start_point,
     git_commit,
     git_config_user,
     git_current_branch,
@@ -29,6 +30,20 @@ from ..utils.sandbox_paths import resolve_repo_dir
 from ..utils.sandbox_state import get_sandbox_backend_sync
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_github_token_for_pr(config: dict[str, Any], thread_id: str) -> str | None:
+    """Resolve a GitHub token for PR operations."""
+    github_token = get_github_token()
+    if github_token:
+        return github_token
+
+    try:
+        github_token, _encrypted_token = asyncio.run(resolve_github_token(config, thread_id))
+    except Exception:  # noqa: BLE001
+        logger.exception("Failed to resolve GitHub token for thread %s", thread_id)
+        return None
+    return github_token
 
 
 def commit_and_open_pr(
@@ -138,7 +153,7 @@ def commit_and_open_pr(
             return {"success": False, "error": "No sandbox found for thread", "pr_url": None}
 
         repo_dir = resolve_repo_dir(sandbox_backend, repo_name)
-        github_token = get_github_token()
+        github_token = _resolve_github_token_for_pr(config, thread_id)
         user_identity = resolve_triggering_user_identity(config, github_token)
         pr_body = add_pr_collaboration_note(body, user_identity)
 
@@ -153,6 +168,7 @@ def commit_and_open_pr(
         branch_name = metadata.get("branch_name")
         current_branch = git_current_branch(sandbox_backend, repo_dir)
         target_branch = branch_name if branch_name else f"open-swe/{thread_id}"
+        base_branch = asyncio.run(get_github_default_branch(repo_owner, repo_name, github_token))
         if current_branch != target_branch:
             if branch_name:
                 # Existing branch — plain checkout, do not create or reset
@@ -163,7 +179,12 @@ def commit_and_open_pr(
                         "error": f"Failed to checkout branch {target_branch}",
                         "pr_url": None,
                     }
-            elif not git_checkout_branch(sandbox_backend, repo_dir, target_branch):
+            elif not git_checkout_branch_from_start_point(
+                sandbox_backend,
+                repo_dir,
+                target_branch,
+                f"origin/{base_branch}",
+            ):
                 return {
                     "success": False,
                     "error": f"Failed to checkout branch {target_branch}",
@@ -204,7 +225,6 @@ def commit_and_open_pr(
                 "pr_url": None,
             }
 
-        base_branch = asyncio.run(get_github_default_branch(repo_owner, repo_name, github_token))
         pr_url, _pr_number, pr_existing = asyncio.run(
             create_github_pr(
                 repo_owner=repo_owner,
